@@ -6,4 +6,7 @@ nohup python -u run.py \
     --max_attached_imgs 3 \
     --temperature 1 \
     --fix_box_color \
+    --window_width 1920 \
+    --window_height 1080 \
     --seed 42 > test_tasks.log &
+    
