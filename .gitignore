@@ -1,5 +1,11 @@
 *.log
 downloads/*.pdf
 results/2024*
+results/2025*/
+results/Exp1_Baseline/
 test_code.py
 __pycache__
+nohup.out
+*.keras
+chromedriver.exe
+chromedriver-win64/

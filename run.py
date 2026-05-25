@@ -6,6 +6,7 @@ import re
 import os
 import shutil
 import logging
+import csv
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -26,7 +27,7 @@ def setup_logger(folder_path):
         logger.removeHandler(handler)
         handler.close()
 
-    handler = logging.FileHandler(log_file_path)
+    handler = logging.FileHandler(log_file_path, encoding='utf-8', mode='w') # mode='w' to overwrite old log if retrying
     formatter = logging.Formatter('%(levelname)s - %(message)s')
     handler.setFormatter(formatter)
     logger.addHandler(handler)
@@ -115,49 +116,29 @@ def format_msg_text_only(it, init_msg, pdf_obs, warn_obs, ac_tree):
 
 
 def call_gpt4v_api(args, openai_client, messages):
-    retry_times = 0
-    while True:
-        try:
-            if not args.text_only:
-                logging.info('Calling gpt4v API...')
-                openai_response = openai_client.chat.completions.create(
-                    model=args.api_model, messages=messages, max_tokens=1000, seed=args.seed
-                )
-            else:
-                logging.info('Calling gpt4 API...')
-                openai_response = openai_client.chat.completions.create(
-                    model=args.api_model, messages=messages, max_tokens=1000, seed=args.seed, timeout=30
-                )
+    try:
+        logging.info(f"Calling model {args.api_model} ...")
+        response = openai_client.chat.completions.create(
+            model=args.api_model,
+            messages=messages,
+            max_tokens=1000,
+            temperature=args.temperature,
+            timeout=60,
+        )
+    except Exception as e:
+        print(f"\n\nCRITICAL API ERROR: {e}\n\n")
+        logging.error(f"API call FAILED: {repr(e)}")
+        return None, None, True, None
 
-            prompt_tokens = openai_response.usage.prompt_tokens
-            completion_tokens = openai_response.usage.completion_tokens
+    try:
+        prompt_tokens = response.usage.prompt_tokens
+        completion_tokens = response.usage.completion_tokens
+    except Exception:
+        prompt_tokens = None
+        completion_tokens = None
 
-            logging.info(f'Prompt Tokens: {prompt_tokens}; Completion Tokens: {completion_tokens}')
-
-            gpt_call_error = False
-            return prompt_tokens, completion_tokens, gpt_call_error, openai_response
-
-        except Exception as e:
-            logging.info(f'Error occurred, retrying. Error type: {type(e).__name__}')
-
-            if type(e).__name__ == 'RateLimitError':
-                time.sleep(10)
-
-            elif type(e).__name__ == 'APIError':
-                time.sleep(15)
-
-            elif type(e).__name__ == 'InvalidRequestError':
-                gpt_call_error = True
-                return None, None, gpt_call_error, None
-
-            else:
-                gpt_call_error = True
-                return None, None, gpt_call_error, None
-
-        retry_times += 1
-        if retry_times == 10:
-            logging.info('Retrying too many times')
-            return None, None, True, None
+    logging.info(f"Model usage – prompt: {prompt_tokens}, completion: {completion_tokens}")
+    return prompt_tokens, completion_tokens, False, response
 
 
 def exec_action_click(info, web_ele, driver_task):
@@ -172,13 +153,11 @@ def exec_action_type(info, web_ele, driver_task):
 
     ele_tag_name = web_ele.tag_name.lower()
     ele_type = web_ele.get_attribute("type")
-    # outer_html = web_ele.get_attribute("outerHTML")
+    
     if (ele_tag_name != 'input' and ele_tag_name != 'textarea') or (ele_tag_name == 'input' and ele_type not in ['text', 'search', 'password', 'email', 'tel']):
         warn_obs = f"note: The web element you're trying to type may not be a textbox, and its tag name is <{web_ele.tag_name}>, type is {ele_type}."
     try:
-        # Not always work to delete
         web_ele.clear()
-        # Another way to delete
         if platform.system() == 'Darwin':
             web_ele.send_keys(Keys.COMMAND + "a")
         else:
@@ -202,7 +181,7 @@ def exec_action_type(info, web_ele, driver_task):
 
     actions.send_keys(Keys.ENTER)
     actions.perform()
-    time.sleep(10)
+    time.sleep(5)
     return warn_obs
 
 
@@ -248,26 +227,43 @@ def main():
     parser.add_argument("--save_accessibility_tree", action='store_true')
     parser.add_argument("--force_device_scale", action='store_true')
     parser.add_argument("--window_width", type=int, default=1024)
-    parser.add_argument("--window_height", type=int, default=768)  # for headless mode, there is no address bar
+    parser.add_argument("--window_height", type=int, default=768)
     parser.add_argument("--fix_box_color", action='store_true')
+    # --- ADDED FOR RESUMING ---
+    parser.add_argument("--specific_result_dir", type=str, default=None, help="Force write to a specific existing directory folder")
 
     args = parser.parse_args()
 
-    # OpenAI client
-    client = OpenAI(api_key=args.api_key)
+    # OLLAMA CLIENT
+    client = OpenAI(
+            base_url="http://localhost:11434/v1",
+            api_key="ollama", 
+        )
 
     options = driver_config(args)
 
     # Save Result file
-    current_time = time.strftime("%Y%m%d_%H_%M_%S", time.localtime())
-    result_dir = os.path.join(args.output_dir, current_time)
+    if args.specific_result_dir:
+        # Resume mode: use existing folder
+        result_dir = args.specific_result_dir
+        print(f"RESUMING EXPERIMENT IN: {result_dir}")
+    else:
+        # Standard mode: create new timestamp folder
+        current_time = time.strftime("%Y%m%d_%H_%M_%S", time.localtime())
+        result_dir = os.path.join(args.output_dir, current_time)
+    
     os.makedirs(result_dir, exist_ok=True)
 
     # Load tasks
     tasks = []
     with open(args.test_file, 'r', encoding='utf-8') as f:
         for line in f:
-            tasks.append(json.loads(line))
+            line = line.strip()
+            if not line: continue  # Skip empty lines
+            try:
+                tasks.append(json.loads(line))
+            except json.JSONDecodeError:
+                print(f"Skipping invalid JSON line: {line[:50]}...")
 
 
     for task_id in range(len(tasks)):
@@ -278,45 +274,51 @@ def main():
         logging.info(f'########## TASK{task["id"]} ##########')
 
         driver_task = webdriver.Chrome(options=options)
-
-        # About window size, 765 tokens
-        # You can resize to height = 512 by yourself (255 tokens, Maybe bad performance)
-        driver_task.set_window_size(args.window_width, args.window_height)  # larger height may contain more web information
+        driver_task.set_window_size(args.window_width, args.window_height)
         driver_task.get(task['web'])
+        
+        # Initial Link of the Task (e.g., google.com)
+        initial_task_link = task['web']
+
         try:
             driver_task.find_element(By.TAG_NAME, 'body').click()
         except:
             pass
-        # sometimes enter SPACE, the page will sroll down
         driver_task.execute_script("""window.onkeydown = function(e) {if(e.keyCode == 32 && e.target.type != 'text' && e.target.type != 'textarea') {e.preventDefault();}};""")
         time.sleep(5)
 
-        # We only deal with PDF file
         for filename in os.listdir(args.download_dir):
             file_path = os.path.join(args.download_dir, filename)
             if os.path.isfile(file_path):
                 os.remove(file_path)
 
-        download_files = []  # sorted(os.listdir(args.download_dir))
+        download_files = []
+        fail_obs = ""
+        pdf_obs = ""
+        warn_obs = ""
 
-        fail_obs = ""  # When error execute the action
-        pdf_obs = ""  # When download PDF file
-        warn_obs = ""  # Type warning
-        pattern = r'Thought:|Action:|Observation:'
-
-        messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
-        obs_prompt = "Observation: please analyze the attached screenshot and give the Thought and Action. "
+        # Using SYSTEM role is crucial for Qwen
+        messages = [{'role': 'system', 'content': SYSTEM_PROMPT}] 
         if args.text_only:
             messages = [{'role': 'system', 'content': SYSTEM_PROMPT_TEXT_ONLY}]
-            obs_prompt = "Observation: please analyze the accessibility tree and give the Thought and Action."
 
         init_msg = f"""Now given a task: {task['ques']}  Please interact with https://www.example.com and get the answer. \n"""
         init_msg = init_msg.replace('https://www.example.com', task['web'])
-        init_msg = init_msg + obs_prompt
+        init_msg += "Observation: please analyze the attached screenshot and give the Thought and Action. "
 
         it = 0
         accumulate_prompt_token = 0
         accumulate_completion_token = 0
+
+        # --- DATASET LOGGING INIT ---
+        dataset_log_path = os.path.join(task_dir, 'dataset_log.jsonl')
+        summary_log_path = os.path.join(task_dir, 'summary.json')
+        
+        reasoning_before_screenshot = "None (Start of Task)"
+        
+        # TRACK STATUS
+        final_task_status = "Failed (Max Iterations Reached)"
+        # ----------------------------
 
         while it < args.max_iter:
             logging.info(f'Iter: {it}')
@@ -330,25 +332,18 @@ def main():
                         ac_tree, obs_info = get_webarena_accessibility_tree(driver_task, accessibility_tree_path)
 
                 except Exception as e:
-                    if not args.text_only:
-                        logging.error('Driver error when adding set-of-mark.')
-                    else:
-                        logging.error('Driver error when obtaining accessibility tree.')
+                    logging.error('Driver error during observation.')
                     logging.error(e)
                     break
 
                 img_path = os.path.join(task_dir, 'screenshot{}.png'.format(it))
                 driver_task.save_screenshot(img_path)
+                
+                # Capture URL of the CURRENT screenshot
+                current_url_of_screenshot = driver_task.current_url
 
-                # accessibility tree
-                if (not args.text_only) and args.save_accessibility_tree:
-                    accessibility_tree_path = os.path.join(task_dir, 'accessibility_tree{}'.format(it))
-                    get_webarena_accessibility_tree(driver_task, accessibility_tree_path)
-
-                # encode image
                 b64_img = encode_image(img_path)
 
-                # format msg
                 if not args.text_only:
                     curr_msg = format_msg(it, init_msg, pdf_obs, warn_obs, b64_img, web_eles_text)
                 else:
@@ -361,52 +356,83 @@ def main():
                 }
                 messages.append(curr_msg)
 
-            # Clip messages, too many attached images may cause confusion
             if not args.text_only:
                 messages = clip_message_and_obs(messages, args.max_attached_imgs)
             else:
                 messages = clip_message_and_obs_text_only(messages, args.max_attached_imgs)
 
-            # Call GPT-4v API
             prompt_tokens, completion_tokens, gpt_call_error, openai_response = call_gpt4v_api(args, client, messages)
 
             if gpt_call_error:
-                break
-            else:
-                accumulate_prompt_token += prompt_tokens
-                accumulate_completion_token += completion_tokens
-                logging.info(f'Accumulate Prompt Tokens: {accumulate_prompt_token}; Accumulate Completion Tokens: {accumulate_completion_token}')
-                logging.info('API call complete...')
+                logging.error("API Call Error. Retrying step...")
+                time.sleep(2)
+                continue
+
+            accumulate_prompt_token += prompt_tokens
+            accumulate_completion_token += completion_tokens
+            
             gpt_4v_res = openai_response.choices[0].message.content
+            
+            # Local model empty response fix
+            if not gpt_4v_res or not gpt_4v_res.strip():
+                logging.warning("Model returned empty response. Retrying...")
+                messages.pop() 
+                time.sleep(1)
+                continue
+
+            logging.info(f"RAW MODEL REPLY:\n{gpt_4v_res}")
             messages.append({'role': 'assistant', 'content': gpt_4v_res})
 
+            # ================= START OF DATASET LOGGING =================
+            # Clean up the current reasoning (Thought ON this image)
+            reasoning_on_this_image = gpt_4v_res
+            if "Action:" in gpt_4v_res:
+                reasoning_on_this_image = gpt_4v_res.split("Action:")[0].replace("Thought:", "").strip()
+            
+            log_entry = {
+                "step_number": it,
+                "screenshot_path_relative": os.path.basename(img_path),
+                "screenshot_path_full": os.path.abspath(img_path),
+                "user_request_task": task['ques'],
+                "initial_task_website": initial_task_link,
+                "current_screenshot_website": current_url_of_screenshot,
+                "reasoning_done_TO_GET_HERE": reasoning_before_screenshot,
+                "reasoning_done_ON_THIS_IMAGE": reasoning_on_this_image,
+                "full_model_response": gpt_4v_res
+            }
 
-            # remove the rects on the website
+            try:
+                with open(dataset_log_path, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(log_entry) + "\n")
+            except Exception as e:
+                logging.error(f"Failed to log dataset entry: {e}")
+
+            # Update for the NEXT loop
+            reasoning_before_screenshot = gpt_4v_res 
+            # ================== END OF DATASET LOGGING ==================
+
             if (not args.text_only) and rects:
-                logging.info(f"Num of interactive elements: {len(rects)}")
                 for rect_ele in rects:
                     driver_task.execute_script("arguments[0].remove()", rect_ele)
                 rects = []
-                # driver_task.save_screenshot(os.path.join(task_dir, 'screenshot{}_no_box.png'.format(it)))
 
-
-            # extract action info
+            pattern = r'Thought:|Action:|Observation:'
             try:
-                assert 'Thought:' in gpt_4v_res and 'Action:' in gpt_4v_res
-            except AssertionError as e:
-                logging.error(e)
-                fail_obs = "Format ERROR: Both 'Thought' and 'Action' should be included in your reply."
-                continue
+                parts = re.split(pattern, gpt_4v_res)
+                if len(parts) >= 3:
+                    chosen_action = parts[2].strip()
+                else:
+                    chosen_action = gpt_4v_res.strip()
+            except Exception as e:
+                logging.error(f"Error when splitting model reply: {e}")
+                chosen_action = gpt_4v_res.strip()
 
-            # bot_thought = re.split(pattern, gpt_4v_res)[1].strip()
-            chosen_action = re.split(pattern, gpt_4v_res)[2].strip()
-            # print(chosen_action)
             action_key, info = extract_information(chosen_action)
-
+            logging.info(f"PARSED ACTION: key={action_key}, info={info}")
             fail_obs = ""
             pdf_obs = ""
             warn_obs = ""
-            # execute action
+
             try:
                 window_handle_task = driver_task.current_window_handle
                 driver_task.switch_to.window(window_handle_task)
@@ -422,28 +448,13 @@ def main():
                                               element_box[1] + element_box[3] // 2)
                         web_ele = driver_task.execute_script("return document.elementFromPoint(arguments[0], arguments[1]);", element_box_center[0], element_box_center[1])
 
-                    ele_tag_name = web_ele.tag_name.lower()
-                    ele_type = web_ele.get_attribute("type")
-
                     exec_action_click(info, web_ele, driver_task)
 
-                    # deal with PDF file
                     current_files = sorted(os.listdir(args.download_dir))
                     if current_files != download_files:
-                        # wait for download finish
                         time.sleep(10)
                         current_files = sorted(os.listdir(args.download_dir))
-
-                        current_download_file = [pdf_file for pdf_file in current_files if pdf_file not in download_files and pdf_file.endswith('.pdf')]
-                        if current_download_file:
-                            pdf_file = current_download_file[0]
-                            pdf_obs = get_pdf_retrieval_ans_from_assistant(client, os.path.join(args.download_dir, pdf_file), task['ques'])
-                            shutil.copy(os.path.join(args.download_dir, pdf_file), task_dir)
-                            pdf_obs = "You downloaded a PDF file, I ask the Assistant API to answer the task based on the PDF file and get the following response: " + pdf_obs
                         download_files = current_files
-
-                    if ele_tag_name == 'button' and ele_type == 'submit':
-                        time.sleep(10)
 
                 elif action_key == 'wait':
                     time.sleep(5)
@@ -480,11 +491,14 @@ def main():
                 elif action_key == 'answer':
                     logging.info(info['content'])
                     logging.info('finish!!')
+                    final_task_status = "Success" # MARK SUCCESS
                     break
 
                 else:
-                    raise NotImplementedError
+                    fail_obs = "The action you have chosen cannot be exected. Please double-check if you have selected the wrong Numerical Label or Action or Action format. Then provide the revised Thought and Action."
+                
                 fail_obs = ""
+            
             except Exception as e:
                 logging.error('driver error info:')
                 logging.error(e)
@@ -493,6 +507,17 @@ def main():
                 else:
                     fail_obs = ""
                 time.sleep(2)
+
+        # --- WRITE FINAL SUMMARY ---
+        summary_data = {
+            "task_id": task["id"],
+            "status": final_task_status,
+            "total_steps": it,
+            "user_request": task['ques']
+        }
+        with open(summary_log_path, 'w', encoding='utf-8') as f:
+            json.dump(summary_data, f, indent=2)
+        # ---------------------------
 
         print_message(messages, task_dir)
         driver_task.quit()
